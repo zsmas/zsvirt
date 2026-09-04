@@ -28,47 +28,66 @@ jobs:
 
           EXTERNAL_ID="github:${REPOSITORY}#$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")"
 
-          TOKEN_RESPONSE="$(
-            curl --fail-with-body \
+          TOKEN_RESPONSE_FILE="$(mktemp)"
+          SEARCH_RESPONSE_FILE="$(mktemp)"
+          UPDATE_RESPONSE_FILE="$(mktemp)"
+          trap 'rm -f "$TOKEN_RESPONSE_FILE" "$SEARCH_RESPONSE_FILE" "$UPDATE_RESPONSE_FILE"' EXIT
+
+          TOKEN_HTTP_STATUS="$(
+            curl \
               --silent \
               --show-error \
+              --output "$TOKEN_RESPONSE_FILE" \
+              --write-out "%{http_code}" \
               --request POST \
               "https://${ZENDESK_SUBDOMAIN}.zendesk.com/oauth/tokens" \
               --header "Content-Type: application/x-www-form-urlencoded" \
               --data-urlencode "grant_type=client_credentials" \
               --data-urlencode "client_id=${ZENDESK_CLIENT_ID}" \
               --data-urlencode "client_secret=${ZENDESK_CLIENT_SECRET}" \
-              --data-urlencode "scope=tickets:read tickets:write" \
+              --data-urlencode "scope=read tickets:write" \
               --data-urlencode "expires_in=300"
           )"
 
-          ACCESS_TOKEN="$(
-            printf '%s' "$TOKEN_RESPONSE" |
-              jq --exit-status --raw-output '.access_token'
-          )"
+          if [[ "$TOKEN_HTTP_STATUS" != "200" ]]; then
+            echo "::error::Zendesk OAuth request failed with HTTP ${TOKEN_HTTP_STATUS}"
+            jq '{error, error_description, description}' "$TOKEN_RESPONSE_FILE" 2>/dev/null ||
+              head -c 1000 "$TOKEN_RESPONSE_FILE"
+            exit 1
+          fi
 
-          SEARCH_RESPONSE="$(
-            curl --fail-with-body \
+          ACCESS_TOKEN="$(jq --exit-status --raw-output '.access_token' "$TOKEN_RESPONSE_FILE")"
+
+          SEARCH_HTTP_STATUS="$(
+            curl \
               --silent \
               --show-error \
+              --output "$SEARCH_RESPONSE_FILE" \
+              --write-out "%{http_code}" \
               --get \
               "https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/search.json" \
               --header "Authorization: Bearer ${ACCESS_TOKEN}" \
               --data-urlencode "query=type:ticket external_id:\"${EXTERNAL_ID}\""
           )"
 
+          if [[ "$SEARCH_HTTP_STATUS" != "200" ]]; then
+            echo "::error::Zendesk ticket search failed with HTTP ${SEARCH_HTTP_STATUS}"
+            jq '{error, error_description, description}' "$SEARCH_RESPONSE_FILE" 2>/dev/null ||
+              head -c 1000 "$SEARCH_RESPONSE_FILE"
+            exit 1
+          fi
+
           TICKET_ID="$(
-            printf '%s' "$SEARCH_RESPONSE" |
-              jq --exit-status --raw-output \
-                --arg external_id "$EXTERNAL_ID" \
-                '[.results[] | select(.external_id == $external_id)] |
-                 if length == 1 then
-                   .[0].id
-                 elif length == 0 then
-                   error("No matching Zendesk ticket was found")
-                 else
-                   error("Multiple Zendesk tickets have the same external_id")
-                 end'
+            jq --exit-status --raw-output \
+              --arg external_id "$EXTERNAL_ID" \
+              '[.results[] | select(.external_id == $external_id)] |
+               if length == 1 then
+                 .[0].id
+               elif length == 0 then
+                 error("No matching Zendesk ticket was found")
+               else
+                 error("Multiple Zendesk tickets have the same external_id")
+               end' "$SEARCH_RESPONSE_FILE"
           )"
 
           jq \
@@ -89,11 +108,24 @@ jobs:
               }
             }' "$GITHUB_EVENT_PATH" > zendesk-comment.json
 
-          curl --fail-with-body \
-            --silent \
-            --show-error \
-            --request PUT \
-            "https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/${TICKET_ID}.json" \
-            --header "Authorization: Bearer ${ACCESS_TOKEN}" \
-            --header "Content-Type: application/json" \
-            --data @zendesk-comment.json
+          UPDATE_HTTP_STATUS="$(
+            curl \
+              --silent \
+              --show-error \
+              --output "$UPDATE_RESPONSE_FILE" \
+              --write-out "%{http_code}" \
+              --request PUT \
+              "https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets/${TICKET_ID}.json" \
+              --header "Authorization: Bearer ${ACCESS_TOKEN}" \
+              --header "Content-Type: application/json" \
+              --data @zendesk-comment.json
+          )"
+
+          if [[ "$UPDATE_HTTP_STATUS" != "200" ]]; then
+            echo "::error::Zendesk ticket update failed with HTTP ${UPDATE_HTTP_STATUS}"
+            jq '{error, error_description, description, details}' "$UPDATE_RESPONSE_FILE" 2>/dev/null ||
+              head -c 1000 "$UPDATE_RESPONSE_FILE"
+            exit 1
+          fi
+
+          echo "GitHub comment added to Zendesk ticket ${TICKET_ID}"
