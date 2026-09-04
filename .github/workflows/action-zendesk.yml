@@ -1,0 +1,106 @@
+name: Create Zendesk ticket for GitHub issue
+
+on:
+  issues:
+    types:
+      - opened
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  create-zendesk-ticket:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Build Zendesk ticket payload
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          jq \
+            --arg repository "$REPOSITORY" \
+            '
+            ($repository
+              | ascii_downcase
+              | gsub("[^a-z0-9]+"; "_")
+            ) as $repository_tag
+            |
+            {
+              ticket: {
+                subject: (
+                  "[GitHub " +
+                  $repository +
+                  "#" +
+                  (.issue.number | tostring) +
+                  "] " +
+                  .issue.title
+                ),
+                comment: {
+                  public: false,
+                  body: (
+                    "A new GitHub issue was created.\n\n" +
+                    "Repository: " + $repository + "\n" +
+                    "Issue: #" + (.issue.number | tostring) + "\n" +
+                    "Reporter: @" + .issue.user.login + "\n" +
+                    "URL: " + .issue.html_url + "\n\n" +
+                    "Labels: " +
+                    ([.issue.labels[].name] |
+                      if length > 0 then join(", ") else "None" end) +
+                    "\n\nDescription:\n" +
+                    (.issue.body // "(No description provided)")
+                  )
+                },
+                status: "new",
+                external_id: (
+                  "github:" +
+                  $repository +
+                  "#" +
+                  (.issue.number | tostring)
+                ),
+                tags: [
+                  "github_issue",
+                  "zsvirt"
+                ]
+              }
+            }
+            ' "$GITHUB_EVENT_PATH" > zendesk-ticket.json
+
+      - name: Get OAuth token and create Zendesk ticket
+        env:
+          ZENDESK_SUBDOMAIN: ${{ secrets.ZENDESK_SUBDOMAIN }}
+          ZENDESK_CLIENT_ID: ${{ secrets.ZENDESK_CLIENT_ID }}
+          ZENDESK_CLIENT_SECRET: ${{ secrets.ZENDESK_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+
+          TOKEN_RESPONSE="$(
+            curl --fail-with-body \
+              --silent \
+              --show-error \
+              --request POST \
+              "https://${ZENDESK_SUBDOMAIN}.zendesk.com/oauth/tokens" \
+              --header "Content-Type: application/x-www-form-urlencoded" \
+              --data-urlencode "grant_type=client_credentials" \
+              --data-urlencode "client_id=${ZENDESK_CLIENT_ID}" \
+              --data-urlencode "client_secret=${ZENDESK_CLIENT_SECRET}" \
+              --data-urlencode "scope=tickets:write" \
+              --data-urlencode "expires_in=300"
+          )"
+
+          ACCESS_TOKEN="$(
+            printf '%s' "$TOKEN_RESPONSE" |
+              jq --exit-status --raw-output '.access_token'
+          )"
+
+          curl --fail-with-body \
+            --silent \
+            --show-error \
+            --request POST \
+            "https://${ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets.json" \
+            --header "Authorization: Bearer ${ACCESS_TOKEN}" \
+            --header "Content-Type: application/json" \
+            --data @zendesk-ticket.json
